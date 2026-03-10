@@ -112,19 +112,23 @@ try:
         batch_start = time.time()
         offset = batch_num * batch_size
 
-        # Use efficient bulk insert
+        # Use efficient bulk insert with CTE to avoid ROW_NUMBER in WHERE clause
         cursor.execute(f"""
+            WITH numbered AS (
+                SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as rn
+                FROM sys.all_columns a
+                CROSS JOIN sys.all_columns b
+            )
             INSERT INTO dbo.LoadTestData (LoadTestID, RecordNumber, TextData, NumericValue, DateValue, ModifiedDate)
             SELECT
-                ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {offset},
-                (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {offset}) % 1000,
-                'Test data for row ' + CAST((ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {offset}) AS VARCHAR(20)),
-                (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {offset}) * 1.5,
-                DATEADD(DAY, -((ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {offset}) % 365), GETDATE()),
+                rn + {offset},
+                (rn + {offset}) % 1000,
+                'Test data for row ' + CAST((rn + {offset}) AS VARCHAR(20)),
+                (rn + {offset}) * 1.5,
+                DATEADD(DAY, -((rn + {offset}) % 365), GETDATE()),
                 GETDATE()
-            FROM sys.all_columns a
-            CROSS JOIN sys.all_columns b
-            WHERE ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) <= {batch_size}
+            FROM numbered
+            WHERE rn <= {batch_size}
         """)
         conn.commit()
 
