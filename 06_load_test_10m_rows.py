@@ -41,7 +41,7 @@ UC_VOLUME_PATH = "/Volumes/main/fh_ingestion/landing"
 
 # Load Test Configuration
 LOAD_TEST_CONFIG = {
-    "target_rows": 1_000_000,        # 1 million rows (reduced from 10M due to DB size limits)
+    "target_rows": 10_000_000,       # 10 million rows
     "batch_size": 10_000,            # 10K rows per batch
     "enable_throttling": True,       # Enable bandwidth throttling
     "target_bandwidth_mbps": 150,    # 150 Megabits per second (75% of 200 Mbps link)
@@ -102,7 +102,7 @@ try:
 
     # Insert in large batches
     print(f"2. Inserting {LOAD_TEST_CONFIG['target_rows']:,} rows in batches...")
-    batch_size = 50_000  # 50K rows per insert batch (reduced for DB size limits)
+    batch_size = 100_000  # 100K rows per insert batch
     total_rows = LOAD_TEST_CONFIG['target_rows']
     batches = total_rows // batch_size
 
