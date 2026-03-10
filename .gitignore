@@ -1,0 +1,44 @@
+# Local configuration with credentials (NEVER commit!)
+config_local.py
+**/config_local.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+*.pem
+*.key
+*.env
+secrets/
+credentials/
+
+# Azure
+.azure/
+
+# Databricks
+.databricks/
+
+# Logs
+*.log
+logs/
