@@ -163,6 +163,39 @@ TABLES_CONFIG = {
 }
 ```
 
+**For JDE Edwards 9.1/9.2 Tables:**
+
+JDE tables typically have 150-200+ columns with extensive audit trails, system fields, and legacy columns. Aggressive column filtering is essential:
+
+```python
+# Example: JDE F4101 (Item Master) - 200+ columns, extract only ~15 essential
+"dbo.F4101": {
+    "columns": [
+        "IMITM",      # Item Number (Short)
+        "IMLITM",     # Item Number (Long)
+        "IMDSC1",     # Description Line 1
+        "IMDSC2",     # Description Line 2
+        "IMGLPT",     # G/L Product Type
+        "IMSRP1",     # Primary Supplier
+        "IMUOM1",     # Primary UOM
+        "IMUNCS",     # Unit Cost
+        "IMURAB",     # Unit Price
+        "IMSTKT",     # Stocking Type
+        "IMPRP1",     # Product Code 1
+        "IMPRP2",     # Product Code 2
+        "IMPRP3",     # Product Code 3
+        "IMUPMJ",     # Date Updated (Julian)
+        "IMUPMT"      # Time Updated
+    ],
+    "cdc_column": "IMUPMJ",          # JDE date field (Julian format)
+    "partition_column": "IMUPMJ"
+}
+
+# Bandwidth Savings for JDE:
+# - Typical JDE table: 150-200 columns → Extract 15 columns = 90%+ bandwidth reduction
+# - 2TB database with full extraction would be ~200GB with selective columns
+```
+
 ### 4. Network Configuration
 
 Allow Databricks Serverless IPs in Azure SQL firewall:
