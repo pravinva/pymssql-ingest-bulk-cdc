@@ -30,7 +30,7 @@ Tested with: **Fulton Hogan (2TB, 200MB pipe)**
           ↓                  │  - Selective     │   Write    │  Hive        │
    ┌──────────────┐          │    columns       │────────────→  Partitioned │
    │ Read Replica │ ExpRoute │  - Batched       │            │  (date=...)  │
-   │ (Kapua)      │◀─────────│  - Throttled     │            └──────┬───────┘
+   │ (Kapua)      │─────────→│  - Throttled     │            └──────┬───────┘
    │ Zero Impact  │   CDC    │  - Checkpoint    │                   │
    └──────────────┘          └──────────────────┘                   │ Auto Loader
                                                                      │ (continuous)
