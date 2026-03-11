@@ -43,7 +43,7 @@ UC_VOLUME_PATH = "/Volumes/main/fh_ingestion/landing"
 LOAD_TEST_CONFIG = {
     "target_rows": 10_000_000,       # 10 million rows
     "batch_size": 10_000,            # 10K rows per batch
-    "enable_throttling": True,       # Enable bandwidth throttling
+    "enable_throttling": False,      # BASELINE TEST: Disable throttling for maximum speed
     "target_bandwidth_mbps": 150,    # 150 Megabits per second (75% of 200 Mbps link)
     "target_bandwidth_MBps": 18.75,  # 18.75 Megabytes per second (150 / 8)
 }
