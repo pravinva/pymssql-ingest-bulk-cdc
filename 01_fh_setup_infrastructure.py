@@ -1,8 +1,19 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Fulton Hogan - SDP + Lakeflow Infrastructure Setup
+# MAGIC # Fulton Hogan - Infrastructure Setup (Direct-to-Delta)
 # MAGIC
-# MAGIC Creates UC volumes and schemas for the Custom Python Data Source pattern
+# MAGIC Creates schemas for direct Delta write pattern (append-only bulk load).
+# MAGIC Aligned with Lakeflow Connect managed connector future state.
+# MAGIC
+# MAGIC **Architecture:**
+# MAGIC - No UC Volumes (writes directly to Bronze Delta tables)
+# MAGIC - Schema inference + evolution enabled
+# MAGIC - Append-only mode (no CDC for now)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Setup Schemas
 
 # COMMAND ----------
 
@@ -13,56 +24,45 @@
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Create schema for FH ingestion
-# MAGIC CREATE SCHEMA IF NOT EXISTS fh_ingestion
-# MAGIC COMMENT 'Fulton Hogan data ingestion using SDP + Lakeflow framework';
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC USE SCHEMA fh_ingestion;
-# MAGIC
-# MAGIC -- Create UC Volume for landing zone
-# MAGIC CREATE VOLUME IF NOT EXISTS landing
-# MAGIC COMMENT 'Landing zone for CDC records from SQL Server (Hive partitioned by date)';
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Create Bronze schema
+# MAGIC -- Create Bronze schema (for directly written Delta tables)
 # MAGIC CREATE SCHEMA IF NOT EXISTS main.fh_bronze
-# MAGIC COMMENT 'Bronze layer - streaming tables ingested via AutoLoader';
+# MAGIC COMMENT 'Bronze layer - direct writes from SQL Server extraction (append-only)';
 # MAGIC
-# MAGIC -- Create Silver schema
+# MAGIC -- Create Silver schema (for DLT transformed tables)
 # MAGIC CREATE SCHEMA IF NOT EXISTS main.fh_silver
-# MAGIC COMMENT 'Silver layer - cleaned and transformed streaming tables';
+# MAGIC COMMENT 'Silver layer - cleaned and transformed via DLT';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verify Setup
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify setup
-# MAGIC SHOW VOLUMES IN main.fh_ingestion;
-
-# COMMAND ----------
-
-# MAGIC %sql
+# MAGIC -- Show schemas
 # MAGIC SHOW SCHEMAS IN main LIKE 'fh_%';
 
 # COMMAND ----------
 
-# Display UC Volume path
-print("✅ Infrastructure Setup Complete")
-print()
-print("UC Volume Path:")
-print("  /Volumes/main/fh_ingestion/landing")
-print()
-print("Expected Structure:")
-print("  /Volumes/main/fh_ingestion/landing/")
-print("    ├── dbo_Assets/date=2024-03-10/*.parquet")
-print("    ├── dbo_WorkOrders/date=2024-03-10/*.parquet")
-print("    └── dbo_MaintenanceRecords/date=2024-03-10/*.parquet")
+# Display setup summary
+print("="*80)
+print("✅ INFRASTRUCTURE SETUP COMPLETE")
+print("="*80)
 print()
 print("Schemas Created:")
-print("  • main.fh_ingestion (landing zone)")
-print("  • main.fh_bronze (Bronze streaming tables)")
-print("  • main.fh_silver (Silver streaming tables)")
+print("  • main.fh_bronze  - Bronze Delta tables (direct writes, append-only)")
+print("  • main.fh_silver  - Silver Delta tables (DLT transformations)")
+print()
+print("Expected Bronze Tables (created by Notebook 02):")
+print("  • main.fh_bronze.dbo_Assets")
+print("  • main.fh_bronze.dbo_WorkOrders")
+print("  • main.fh_bronze.dbo_MaintenanceRecords")
+print()
+print("Table Properties:")
+print("  ✓ Schema inference enabled")
+print("  ✓ Schema evolution enabled (mergeSchema)")
+print("  ✓ Change Data Feed enabled (for DLT)")
+print("  ✓ Append-only mode (bulk load for network testing)")
+print()
+print("="*80)

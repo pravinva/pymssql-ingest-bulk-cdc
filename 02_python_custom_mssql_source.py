@@ -1,12 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Python Custom MSSQL Source (SDP Component)
+# MAGIC # Python Custom MSSQL Source (Direct-to-Delta)
 # MAGIC
 # MAGIC Custom Python data source that:
-# MAGIC - Connects to SQL Server read replica using pymssql
-# MAGIC - Extracts data with CDC support (timestamp-based or Change Tracking)
-# MAGIC - Writes to UC Volume as Hive-partitioned Parquet files
+# MAGIC - Connects to SQL Server using pymssql
+# MAGIC - Extracts data in batches (append-only bulk load)
+# MAGIC - Writes directly to Bronze Delta tables
 # MAGIC - Runs natively on SDP Serverless (no driver installation required)
+# MAGIC - Aligned with Lakeflow Connect managed connector future state
+# MAGIC
+# MAGIC **Key Features:**
+# MAGIC - Schema inference + evolution enabled
+# MAGIC - Change Data Feed enabled (for DLT consumption)
+# MAGIC - Bandwidth throttling for network-constrained environments
 
 # COMMAND ----------
 
@@ -28,13 +34,14 @@ dbutils.library.restartPython()
 import pymssql
 from datetime import datetime, date
 import time
+from pyspark.sql.types import *
 
 # Source: Azure SQL (use Secrets in production)
 SOURCE_CONFIG = {
-    "host": "<your-server>.database.windows.net",
+    "host": dbutils.secrets.get(scope="sql_server", key="host"),
     "port": 1433,
-    "database": "<your-database>",
-    "user": "<your-username>",
+    "database": dbutils.secrets.get(scope="sql_server", key="database"),
+    "user": dbutils.secrets.get(scope="sql_server", key="username"),
     "password": dbutils.secrets.get(scope="sql_server", key="password")
 }
 
@@ -47,53 +54,49 @@ SOURCE_CONFIG = {
 #     "password": dbutils.secrets.get("fh-scope", "kapua-password")
 # }
 
-# Destination: UC Volume
-UC_VOLUME_PATH = "/Volumes/main/fh_ingestion/landing"
-
 # Extraction config
 BATCH_SIZE = 10_000
 SLEEP_MS = 200
 
+# Throttling config (for network-constrained environments like Fulton Hogan)
+ENABLE_THROTTLING = True      # Set to False for same-region Azure VM sources
+TARGET_BANDWIDTH_MBPS = 150   # Target bandwidth in Megabits per second (150 Mbps = 18.75 MB/s)
+
 # Tables with selective columns (as validated in testing)
 TABLES_CONFIG = {
     "dbo.Assets": {
-        "columns": ["AssetID", "AssetNumber", "AssetName", "AssetType", "Location", "Status", "ModifiedDate"],
-        "cdc_column": "ModifiedDate",  # For timestamp-based CDC
-        "partition_column": "ModifiedDate"  # For Hive partitioning
+        "columns": ["AssetID", "AssetNumber", "AssetName", "AssetType", "Location", "Status", "ModifiedDate"]
     },
     "dbo.WorkOrders": {
-        "columns": ["WorkOrderID", "WorkOrderNumber", "Description", "Status", "Priority", "AssetID", "CreatedDate", "ModifiedDate"],
-        "cdc_column": "ModifiedDate",
-        "partition_column": "CreatedDate"
+        "columns": ["WorkOrderID", "WorkOrderNumber", "Description", "Status", "Priority", "AssetID", "CreatedDate", "ModifiedDate"]
     },
     "dbo.MaintenanceRecords": {
-        "columns": ["MaintenanceID", "AssetID", "WorkOrderID", "MaintenanceType", "MaintenanceDate", "Cost", "Duration", "ModifiedDate"],
-        "cdc_column": "ModifiedDate",
-        "partition_column": "MaintenanceDate"
+        "columns": ["MaintenanceID", "AssetID", "WorkOrderID", "MaintenanceType", "MaintenanceDate", "Cost", "Duration", "ModifiedDate"]
     }
 }
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Python Custom MSSQL Source Class
+# MAGIC ## Python Custom MSSQL Source Class (Direct-to-Delta)
 
 # COMMAND ----------
 
-class PythonCustomMSSQLSource:
+class DirectDeltaMSSQLSource:
     """
-    Custom Python MSSQL Source for SDP + Lakeflow Framework
+    Custom Python MSSQL Source for Direct Delta Writes
 
     Features:
-    - Connects to SQL Server read replica (no primary access required)
-    - Supports CDC via timestamp-based extraction
-    - Writes Hive-partitioned Parquet to UC Volume
-    - Runs on Serverless (no driver installation needed)
+    - Connects to SQL Server (no primary access required)
+    - Bulk load with append mode (no CDC for now)
+    - Writes directly to Bronze Delta tables
+    - Schema inference + evolution enabled
+    - Change Data Feed enabled (for DLT)
+    - Bandwidth throttling support
     """
 
-    def __init__(self, config, uc_volume_path):
+    def __init__(self, config):
         self.config = config
-        self.uc_volume_path = uc_volume_path
         self.stats = []
 
     def connect(self):
@@ -107,58 +110,22 @@ class PythonCustomMSSQLSource:
             timeout=300
         )
 
-    def get_last_extracted_value(self, table_name, cdc_column):
+    def extract_and_write_delta(self, table_name, columns):
         """
-        Get last extracted CDC value from checkpoint
-
-        In production, read from Delta checkpoint table.
-        For now, extract all data (bulk mode).
-        """
-        # TODO: Implement checkpoint reading
-        # return spark.read.table("main.fh_ingestion.checkpoints") \
-        #     .filter(f"table_name = '{table_name}'") \
-        #     .select("last_cdc_value") \
-        #     .first()[0]
-
-        # For bulk extract, return None
-        return None
-
-    def save_checkpoint(self, table_name, cdc_column, last_value):
-        """
-        Save CDC checkpoint for incremental extraction
-
-        In production, write to Delta checkpoint table.
-        """
-        # TODO: Implement checkpoint saving
-        # checkpoint_df = spark.createDataFrame([{
-        #     "table_name": table_name,
-        #     "cdc_column": cdc_column,
-        #     "last_cdc_value": last_value,
-        #     "extraction_timestamp": datetime.now()
-        # }])
-        # checkpoint_df.write.mode("merge").saveAsTable("main.fh_ingestion.checkpoints")
-        pass
-
-    def extract_table(self, table_name, columns, cdc_column, partition_column, mode='bulk'):
-        """
-        Extract table with CDC support and Hive partitioning
+        Extract table and write directly to Bronze Delta table
 
         Args:
             table_name: SQL Server table name (e.g., 'dbo.Assets')
             columns: List of columns to extract
-            cdc_column: Column for CDC (e.g., 'ModifiedDate')
-            partition_column: Column for Hive partitioning (e.g., 'CreatedDate')
-            mode: 'bulk' or 'incremental'
 
         Returns:
             Extraction statistics
         """
         print(f"\n{'='*80}")
-        print(f"Extracting: {table_name} (mode={mode})")
+        print(f"Extracting: {table_name} (append-only bulk load)")
         print(f"{'='*80}")
         print(f"Columns: {len(columns)}")
-        print(f"CDC Column: {cdc_column}")
-        print(f"Partition Column: {partition_column}")
+        print(f"Target: main.fh_bronze.{table_name.replace('.', '_')}")
         print()
 
         start_time = time.time()
@@ -168,60 +135,39 @@ class PythonCustomMSSQLSource:
         conn = self.connect()
 
         try:
-            # Get last extracted value for incremental mode
-            last_cdc_value = None
-            if mode == 'incremental':
-                last_cdc_value = self.get_last_extracted_value(table_name, cdc_column)
-
             # Build query
             columns_str = ", ".join(columns)
-
-            if mode == 'bulk':
-                # Bulk: Extract everything
-                base_query = f"""
-                SELECT {columns_str}
-                FROM {table_name}
-                ORDER BY (SELECT NULL)
-                OFFSET {{offset}} ROWS
-                FETCH NEXT {BATCH_SIZE} ROWS ONLY
-                """
-            else:
-                # Incremental: Extract only new/changed records
-                base_query = f"""
-                SELECT {columns_str}
-                FROM {table_name}
-                WHERE {cdc_column} > '{{last_cdc_value}}'
-                ORDER BY {cdc_column}
-                OFFSET {{offset}} ROWS
-                FETCH NEXT {BATCH_SIZE} ROWS ONLY
-                """
+            base_query = f"""
+            SELECT {columns_str}
+            FROM {table_name}
+            ORDER BY (SELECT NULL)
+            OFFSET {{offset}} ROWS
+            FETCH NEXT {BATCH_SIZE} ROWS ONLY
+            """
 
             # Get row count (use non-dict cursor for COUNT)
             count_cursor = conn.cursor()
-            if mode == 'bulk':
-                count_cursor.execute(f"SELECT COUNT_BIG(*) FROM {table_name}")
-            else:
-                count_cursor.execute(f"SELECT COUNT_BIG(*) FROM {table_name} WHERE {cdc_column} > '{last_cdc_value}'")
-
+            count_cursor.execute(f"SELECT COUNT_BIG(*) FROM {table_name}")
             row_count = count_cursor.fetchone()[0]
+            count_cursor.close()
 
-            # Now create dict cursor for data extraction
-            cursor = conn.cursor(as_dict=True)
             print(f"Total rows: {row_count:,}")
             print()
 
-            # Extract in batches with Hive partitioning
+            # Create dict cursor for data extraction
+            cursor = conn.cursor(as_dict=True)
+
+            # Target Delta table
+            target_table = f"main.fh_bronze.{table_name.replace('.', '_')}"
+
+            # Extract in batches and write to Delta
             offset = 0
             while True:
                 batch_num += 1
                 batch_start = time.time()
 
                 # Execute query
-                if mode == 'bulk':
-                    query = base_query.format(offset=offset)
-                else:
-                    query = base_query.format(last_cdc_value=last_cdc_value, offset=offset)
-
+                query = base_query.format(offset=offset)
                 cursor.execute(query)
                 rows = cursor.fetchall()
 
@@ -231,32 +177,23 @@ class PythonCustomMSSQLSource:
                 batch_rows = len(rows)
                 total_rows += batch_rows
 
-                # Write to UC Volume with Hive partitioning by date
-                # Use Spark directly (no pandas)
-                table_safe_name = table_name.replace(".", "_")
-                table_path = f"{self.uc_volume_path}/{table_safe_name}"
-
-                # Convert rows to Spark DataFrame directly
+                # Convert to Spark DataFrame (schema inference)
                 spark_df = spark.createDataFrame(rows)
 
-                if partition_column in spark_df.columns:
-                    # Add partition date column for Hive partitioning
-                    from pyspark.sql.functions import to_date
-                    spark_df = spark_df.withColumn("date", to_date(partition_column))
+                # Add metadata columns
+                from pyspark.sql.functions import current_timestamp, lit
+                spark_df = spark_df \
+                    .withColumn("_ingestion_timestamp", current_timestamp()) \
+                    .withColumn("_source_table", lit(table_name))
 
-                    # Write with Hive partitioning by date
-                    (spark_df
-                        .write
-                        .mode("append")
-                        .partitionBy("date")
-                        .parquet(table_path))
-
-                else:
-                    # No partition column, write without partitioning
-                    (spark_df
-                        .write
-                        .mode("append")
-                        .parquet(table_path))
+                # Write to Bronze Delta table with append mode
+                (spark_df
+                    .write
+                    .format("delta")
+                    .mode("append")
+                    .option("mergeSchema", "true")  # Schema evolution
+                    .option("delta.enableChangeDataFeed", "true")  # For DLT
+                    .saveAsTable(target_table))
 
                 batch_elapsed = time.time() - batch_start
                 throughput = batch_rows / batch_elapsed if batch_elapsed > 0 else 0
@@ -268,32 +205,29 @@ class PythonCustomMSSQLSource:
                       f"Time: {batch_elapsed:5.2f}s | "
                       f"Throughput: {throughput:8.0f} rows/s")
 
-                # Throttle
-                if SLEEP_MS > 0:
+                # Throttle if enabled
+                if ENABLE_THROTTLING and SLEEP_MS > 0:
                     time.sleep(SLEEP_MS / 1000.0)
 
                 offset += BATCH_SIZE
 
+                # Safety limit
                 if batch_num > 10000:
                     break
+
+            cursor.close()
 
             elapsed = time.time() - start_time
             avg_throughput = total_rows / elapsed if elapsed > 0 else 0
 
-            # Save checkpoint for next incremental run
-            if total_rows > 0 and cdc_column:
-                # Use non-dict cursor for MAX query (unnamed column)
-                count_cursor.execute(f"SELECT MAX({cdc_column}) FROM {table_name}")
-                max_cdc_value = count_cursor.fetchone()[0]
-                self.save_checkpoint(table_name, cdc_column, max_cdc_value)
-
             print()
             print(f"✅ Extraction complete: {total_rows:,} rows in {elapsed:.1f}s")
+            print(f"   Written to: {target_table}")
             print()
 
             return {
                 "table_name": table_name,
-                "mode": mode,
+                "target_table": target_table,
                 "total_rows": total_rows,
                 "elapsed_sec": elapsed,
                 "throughput_rows_sec": avg_throughput,
@@ -306,7 +240,6 @@ class PythonCustomMSSQLSource:
             traceback.print_exc()
             return {
                 "table_name": table_name,
-                "mode": mode,
                 "status": "failed",
                 "error": str(e)
             }
@@ -322,18 +255,15 @@ class PythonCustomMSSQLSource:
 # COMMAND ----------
 
 # Initialize source
-source = PythonCustomMSSQLSource(SOURCE_CONFIG, UC_VOLUME_PATH)
+source = DirectDeltaMSSQLSource(SOURCE_CONFIG)
 
 # Extract all tables
 results = []
 
 for table_name, config in TABLES_CONFIG.items():
-    result = source.extract_table(
+    result = source.extract_and_write_delta(
         table_name=table_name,
-        columns=config['columns'],
-        cdc_column=config['cdc_column'],
-        partition_column=config['partition_column'],
-        mode='bulk'  # Change to 'incremental' for CDC mode
+        columns=config['columns']
     )
     results.append(result)
 
@@ -351,28 +281,38 @@ print("="*80)
 for result in results:
     if result['status'] == 'success':
         print(f"✅ {result['table_name']:40s} | {result['total_rows']:12,} rows | {result['throughput_rows_sec']:8,.0f} rows/s")
+        print(f"   Target: {result['target_table']}")
     else:
         print(f"❌ {result['table_name']:40s} | FAILED: {result.get('error', 'Unknown')}")
 
 print()
-print("Next Step: Run DLT pipeline to ingest into Bronze/Silver tables")
+print("Next Step: Run DLT pipeline (Notebook 03) to transform Bronze → Silver")
 print()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify Files in UC Volume
+# MAGIC ## Verify Bronze Delta Tables
 
 # COMMAND ----------
 
-# List files in UC Volume
-display(dbutils.fs.ls(UC_VOLUME_PATH))
+# MAGIC %sql
+# MAGIC -- Show Bronze tables
+# MAGIC SHOW TABLES IN main.fh_bronze;
 
 # COMMAND ----------
 
-# Check one table's Hive partitions
-table_path = f"{UC_VOLUME_PATH}/dbo_Assets"
-try:
-    display(dbutils.fs.ls(table_path))
-except:
-    print(f"No files yet in {table_path}")
+# MAGIC %sql
+# MAGIC -- Check one table's properties
+# MAGIC DESCRIBE EXTENDED main.fh_bronze.dbo_Assets;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Quick row count check
+# MAGIC SELECT
+#  'dbo_Assets' as table_name,
+#   COUNT(*) as row_count,
+#   MIN(_ingestion_timestamp) as first_ingestion,
+#   MAX(_ingestion_timestamp) as last_ingestion
+# MAGIC FROM main.fh_bronze.dbo_Assets;
