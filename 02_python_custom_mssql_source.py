@@ -1,11 +1,14 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Python Custom MSSQL Source (Direct-to-Delta)
+# MAGIC # Python Custom MSSQL Source (Direct-to-Delta with Checkpointing)
 # MAGIC
 # MAGIC Custom Python data source that:
 # MAGIC - Connects to SQL Server using pymssql
 # MAGIC - Extracts data in batches (append-only bulk load)
 # MAGIC - Writes directly to Bronze Delta tables
+# MAGIC - **Batch-level checkpointing for resume capability**
+# MAGIC - **Retry logic for resilience**
+# MAGIC - **Audit logging for traceability**
 # MAGIC - Runs natively on SDP Serverless (no driver installation required)
 # MAGIC - Aligned with Lakeflow Connect managed connector future state
 # MAGIC
@@ -13,6 +16,7 @@
 # MAGIC - Schema inference + evolution enabled
 # MAGIC - Change Data Feed enabled (for DLT consumption)
 # MAGIC - Bandwidth throttling for network-constrained environments
+# MAGIC - Resume from last successful batch on failure
 
 # COMMAND ----------
 
@@ -35,6 +39,7 @@ import pymssql
 from datetime import datetime, date
 import time
 from pyspark.sql.types import *
+from pyspark.sql.functions import lit, current_timestamp
 
 # Source: Azure SQL (use Secrets in production)
 SOURCE_CONFIG = {
@@ -57,6 +62,7 @@ SOURCE_CONFIG = {
 # Extraction config
 BATCH_SIZE = 10_000
 SLEEP_MS = 200
+MAX_RETRIES = 3  # Retry failed batches up to 3 times
 
 # Throttling config (for network-constrained environments like Fulton Hogan)
 ENABLE_THROTTLING = True      # Set to False for same-region Azure VM sources
@@ -78,26 +84,73 @@ TABLES_CONFIG = {
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Python Custom MSSQL Source Class (Direct-to-Delta)
+# MAGIC ## Setup Checkpoint and Audit Tables
 
 # COMMAND ----------
 
-class DirectDeltaMSSQLSource:
+# MAGIC %sql
+# MAGIC -- Create checkpoint table for batch-level progress tracking
+# MAGIC CREATE TABLE IF NOT EXISTS main.fh_bronze.extraction_checkpoints (
+# MAGIC   extraction_run_id STRING COMMENT 'Unique ID for this extraction run',
+# MAGIC   table_name STRING COMMENT 'Source table name',
+# MAGIC   batch_number INT COMMENT 'Batch number (1-based)',
+# MAGIC   batch_start_offset BIGINT COMMENT 'Starting offset for this batch',
+# MAGIC   batch_end_offset BIGINT COMMENT 'Ending offset for this batch',
+# MAGIC   batch_row_count INT COMMENT 'Rows in this batch',
+# MAGIC   status STRING COMMENT 'Status: processing, success, failed',
+# MAGIC   start_timestamp TIMESTAMP COMMENT 'When batch processing started',
+# MAGIC   end_timestamp TIMESTAMP COMMENT 'When batch processing completed',
+# MAGIC   error_message STRING COMMENT 'Error message if failed',
+# MAGIC   retry_count INT COMMENT 'Number of retries attempted'
+# MAGIC ) USING DELTA
+# MAGIC COMMENT 'Batch-level checkpoints for extraction resume capability';
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Create audit log table for batch-level traceability
+# MAGIC CREATE TABLE IF NOT EXISTS main.fh_bronze.extraction_audit_log (
+# MAGIC   extraction_run_id STRING COMMENT 'Unique ID for this extraction run',
+# MAGIC   table_name STRING COMMENT 'Source table name',
+# MAGIC   target_table STRING COMMENT 'Target Delta table name',
+# MAGIC   total_batches INT COMMENT 'Total number of batches',
+# MAGIC   completed_batches INT COMMENT 'Successfully completed batches',
+# MAGIC   failed_batches INT COMMENT 'Failed batches',
+# MAGIC   total_rows_extracted BIGINT COMMENT 'Total rows extracted',
+# MAGIC   start_timestamp TIMESTAMP COMMENT 'Extraction start time',
+# MAGIC   end_timestamp TIMESTAMP COMMENT 'Extraction end time',
+# MAGIC   duration_seconds DOUBLE COMMENT 'Total duration in seconds',
+# MAGIC   avg_throughput_rows_sec DOUBLE COMMENT 'Average throughput',
+# MAGIC   status STRING COMMENT 'Overall status: success, partial, failed'
+# MAGIC ) USING DELTA
+# MAGIC COMMENT 'Audit log for extraction runs (simulates file-level audit trail)';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Python Custom MSSQL Source Class (Enhanced with Checkpointing)
+
+# COMMAND ----------
+
+class ResilientDeltaMSSQLSource:
     """
-    Custom Python MSSQL Source for Direct Delta Writes
+    Resilient Python MSSQL Source for Direct Delta Writes
 
     Features:
     - Connects to SQL Server (no primary access required)
     - Bulk load with append mode (no CDC for now)
     - Writes directly to Bronze Delta tables
+    - Batch-level checkpointing for resume capability
+    - Automatic retry logic for failed batches
+    - Comprehensive audit logging
     - Schema inference + evolution enabled
     - Change Data Feed enabled (for DLT)
     - Bandwidth throttling support
     """
 
-    def __init__(self, config):
+    def __init__(self, config, extraction_run_id=None):
         self.config = config
-        self.stats = []
+        self.extraction_run_id = extraction_run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     def connect(self):
         """Establish connection to SQL Server"""
@@ -110,9 +163,145 @@ class DirectDeltaMSSQLSource:
             timeout=300
         )
 
+    def get_last_successful_batch(self, table_name):
+        """Get the last successfully completed batch for resume capability"""
+        try:
+            checkpoint_df = spark.sql(f"""
+                SELECT MAX(batch_end_offset) as last_offset
+                FROM main.fh_bronze.extraction_checkpoints
+                WHERE table_name = '{table_name}'
+                  AND status = 'success'
+                  AND extraction_run_id = '{self.extraction_run_id}'
+            """)
+
+            last_offset = checkpoint_df.first()["last_offset"]
+            return last_offset if last_offset else 0
+        except:
+            return 0
+
+    def log_batch_checkpoint(self, table_name, batch_number, start_offset, end_offset,
+                            row_count, status, start_time, end_time=None,
+                            error_message=None, retry_count=0):
+        """Log batch-level checkpoint for audit and resume"""
+        checkpoint_data = [{
+            "extraction_run_id": self.extraction_run_id,
+            "table_name": table_name,
+            "batch_number": batch_number,
+            "batch_start_offset": start_offset,
+            "batch_end_offset": end_offset,
+            "batch_row_count": row_count,
+            "status": status,
+            "start_timestamp": start_time,
+            "end_timestamp": end_time or datetime.now(),
+            "error_message": error_message,
+            "retry_count": retry_count
+        }]
+
+        checkpoint_df = spark.createDataFrame(checkpoint_data)
+        checkpoint_df.write.format("delta").mode("append").saveAsTable("main.fh_bronze.extraction_checkpoints")
+
+    def log_extraction_audit(self, table_name, target_table, total_batches, completed_batches,
+                            failed_batches, total_rows, start_time, end_time, status):
+        """Log extraction run audit summary"""
+        duration = (end_time - start_time).total_seconds()
+        avg_throughput = total_rows / duration if duration > 0 else 0
+
+        audit_data = [{
+            "extraction_run_id": self.extraction_run_id,
+            "table_name": table_name,
+            "target_table": target_table,
+            "total_batches": total_batches,
+            "completed_batches": completed_batches,
+            "failed_batches": failed_batches,
+            "total_rows_extracted": total_rows,
+            "start_timestamp": start_time,
+            "end_timestamp": end_time,
+            "duration_seconds": duration,
+            "avg_throughput_rows_sec": avg_throughput,
+            "status": status
+        }]
+
+        audit_df = spark.createDataFrame(audit_data)
+        audit_df.write.format("delta").mode("append").saveAsTable("main.fh_bronze.extraction_audit_log")
+
+    def extract_batch_with_retry(self, cursor, query, batch_number, offset, target_table, table_name):
+        """Extract a single batch with retry logic"""
+        for retry in range(MAX_RETRIES):
+            batch_start_time = datetime.now()
+
+            try:
+                # Execute query
+                cursor.execute(query.format(offset=offset))
+                rows = cursor.fetchall()
+
+                if not rows:
+                    return None, 0
+
+                batch_rows = len(rows)
+
+                # Convert to Spark DataFrame (schema inference)
+                spark_df = spark.createDataFrame(rows)
+
+                # Add metadata columns
+                spark_df = spark_df \
+                    .withColumn("_ingestion_timestamp", current_timestamp()) \
+                    .withColumn("_source_table", lit(table_name)) \
+                    .withColumn("_extraction_run_id", lit(self.extraction_run_id)) \
+                    .withColumn("_batch_number", lit(batch_number))
+
+                # Write to Bronze Delta table with append mode
+                (spark_df
+                    .write
+                    .format("delta")
+                    .mode("append")
+                    .option("mergeSchema", "true")  # Schema evolution
+                    .option("delta.enableChangeDataFeed", "true")  # For DLT
+                    .saveAsTable(target_table))
+
+                # Log successful batch
+                self.log_batch_checkpoint(
+                    table_name=table_name,
+                    batch_number=batch_number,
+                    start_offset=offset,
+                    end_offset=offset + batch_rows,
+                    row_count=batch_rows,
+                    status="success",
+                    start_time=batch_start_time,
+                    end_time=datetime.now(),
+                    retry_count=retry
+                )
+
+                return rows, batch_rows
+
+            except Exception as e:
+                error_msg = str(e)
+                print(f"   ⚠️  Batch {batch_number} failed (attempt {retry + 1}/{MAX_RETRIES}): {error_msg}")
+
+                # Log failed attempt
+                self.log_batch_checkpoint(
+                    table_name=table_name,
+                    batch_number=batch_number,
+                    start_offset=offset,
+                    end_offset=offset + BATCH_SIZE,
+                    row_count=0,
+                    status="failed",
+                    start_time=batch_start_time,
+                    error_message=error_msg,
+                    retry_count=retry
+                )
+
+                if retry < MAX_RETRIES - 1:
+                    # Wait before retry (exponential backoff)
+                    wait_time = 2 ** retry
+                    print(f"   Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"   ❌ Batch {batch_number} failed after {MAX_RETRIES} attempts")
+                    raise
+
     def extract_and_write_delta(self, table_name, columns):
         """
-        Extract table and write directly to Bronze Delta table
+        Extract table and write directly to Bronze Delta table with checkpointing
 
         Args:
             table_name: SQL Server table name (e.g., 'dbo.Assets')
@@ -122,15 +311,20 @@ class DirectDeltaMSSQLSource:
             Extraction statistics
         """
         print(f"\n{'='*80}")
-        print(f"Extracting: {table_name} (append-only bulk load)")
+        print(f"Extracting: {table_name}")
+        print(f"Extraction Run ID: {self.extraction_run_id}")
         print(f"{'='*80}")
         print(f"Columns: {len(columns)}")
-        print(f"Target: main.fh_bronze.{table_name.replace('.', '_')}")
+
+        target_table = f"main.fh_bronze.{table_name.replace('.', '_')}"
+        print(f"Target: {target_table}")
         print()
 
-        start_time = time.time()
+        extraction_start_time = datetime.now()
         total_rows = 0
         batch_num = 0
+        completed_batches = 0
+        failed_batches = 0
 
         conn = self.connect()
 
@@ -145,65 +339,47 @@ class DirectDeltaMSSQLSource:
             FETCH NEXT {BATCH_SIZE} ROWS ONLY
             """
 
-            # Get row count (use non-dict cursor for COUNT)
+            # Get row count
             count_cursor = conn.cursor()
             count_cursor.execute(f"SELECT COUNT_BIG(*) FROM {table_name}")
             row_count = count_cursor.fetchone()[0]
             count_cursor.close()
 
             print(f"Total rows: {row_count:,}")
+
+            # Check for resume point
+            resume_offset = self.get_last_successful_batch(table_name)
+            if resume_offset > 0:
+                print(f"Resuming from offset: {resume_offset:,}")
             print()
 
             # Create dict cursor for data extraction
             cursor = conn.cursor(as_dict=True)
 
-            # Target Delta table
-            target_table = f"main.fh_bronze.{table_name.replace('.', '_')}"
-
-            # Extract in batches and write to Delta
-            offset = 0
+            # Extract in batches
+            offset = resume_offset
             while True:
                 batch_num += 1
-                batch_start = time.time()
 
-                # Execute query
-                query = base_query.format(offset=offset)
-                cursor.execute(query)
-                rows = cursor.fetchall()
+                rows, batch_rows = self.extract_batch_with_retry(
+                    cursor=cursor,
+                    query=base_query,
+                    batch_number=batch_num,
+                    offset=offset,
+                    target_table=target_table,
+                    table_name=table_name
+                )
 
-                if not rows:
+                if rows is None:
                     break
 
-                batch_rows = len(rows)
                 total_rows += batch_rows
-
-                # Convert to Spark DataFrame (schema inference)
-                spark_df = spark.createDataFrame(rows)
-
-                # Add metadata columns
-                from pyspark.sql.functions import current_timestamp, lit
-                spark_df = spark_df \
-                    .withColumn("_ingestion_timestamp", current_timestamp()) \
-                    .withColumn("_source_table", lit(table_name))
-
-                # Write to Bronze Delta table with append mode
-                (spark_df
-                    .write
-                    .format("delta")
-                    .mode("append")
-                    .option("mergeSchema", "true")  # Schema evolution
-                    .option("delta.enableChangeDataFeed", "true")  # For DLT
-                    .saveAsTable(target_table))
-
-                batch_elapsed = time.time() - batch_start
-                throughput = batch_rows / batch_elapsed if batch_elapsed > 0 else 0
+                completed_batches += 1
 
                 pct = (total_rows / row_count * 100) if row_count > 0 else 0
-                print(f"Batch {batch_num:4d} | "
+                print(f"✅ Batch {batch_num:4d} | "
                       f"Rows: {batch_rows:6,} | "
-                      f"Total: {total_rows:10,} ({pct:5.1f}%) | "
-                      f"Time: {batch_elapsed:5.2f}s | "
-                      f"Throughput: {throughput:8.0f} rows/s")
+                      f"Total: {total_rows:10,} ({pct:5.1f}%)")
 
                 # Throttle if enabled
                 if ENABLE_THROTTLING and SLEEP_MS > 0:
@@ -217,27 +393,64 @@ class DirectDeltaMSSQLSource:
 
             cursor.close()
 
-            elapsed = time.time() - start_time
+            extraction_end_time = datetime.now()
+
+            # Log audit summary
+            status = "success" if failed_batches == 0 else "partial"
+            self.log_extraction_audit(
+                table_name=table_name,
+                target_table=target_table,
+                total_batches=batch_num,
+                completed_batches=completed_batches,
+                failed_batches=failed_batches,
+                total_rows=total_rows,
+                start_time=extraction_start_time,
+                end_time=extraction_end_time,
+                status=status
+            )
+
+            elapsed = (extraction_end_time - extraction_start_time).total_seconds()
             avg_throughput = total_rows / elapsed if elapsed > 0 else 0
 
             print()
             print(f"✅ Extraction complete: {total_rows:,} rows in {elapsed:.1f}s")
-            print(f"   Written to: {target_table}")
+            print(f"   Target: {target_table}")
+            print(f"   Completed batches: {completed_batches}")
+            print(f"   Failed batches: {failed_batches}")
             print()
 
             return {
                 "table_name": table_name,
                 "target_table": target_table,
+                "extraction_run_id": self.extraction_run_id,
                 "total_rows": total_rows,
+                "completed_batches": completed_batches,
+                "failed_batches": failed_batches,
                 "elapsed_sec": elapsed,
                 "throughput_rows_sec": avg_throughput,
-                "status": "success"
+                "status": status
             }
 
         except Exception as e:
             print(f"❌ ERROR: {e}")
             import traceback
             traceback.print_exc()
+
+            extraction_end_time = datetime.now()
+
+            # Log failed extraction
+            self.log_extraction_audit(
+                table_name=table_name,
+                target_table=target_table,
+                total_batches=batch_num,
+                completed_batches=completed_batches,
+                failed_batches=failed_batches + 1,
+                total_rows=total_rows,
+                start_time=extraction_start_time,
+                end_time=extraction_end_time,
+                status="failed"
+            )
+
             return {
                 "table_name": table_name,
                 "status": "failed",
@@ -254,8 +467,11 @@ class DirectDeltaMSSQLSource:
 
 # COMMAND ----------
 
-# Initialize source
-source = DirectDeltaMSSQLSource(SOURCE_CONFIG)
+# Initialize source (generates unique extraction_run_id)
+source = ResilientDeltaMSSQLSource(SOURCE_CONFIG)
+
+print(f"Extraction Run ID: {source.extraction_run_id}")
+print()
 
 # Extract all tables
 results = []
@@ -279,15 +495,55 @@ print("EXTRACTION SUMMARY")
 print("="*80)
 
 for result in results:
-    if result['status'] == 'success':
+    if result['status'] in ['success', 'partial']:
         print(f"✅ {result['table_name']:40s} | {result['total_rows']:12,} rows | {result['throughput_rows_sec']:8,.0f} rows/s")
         print(f"   Target: {result['target_table']}")
+        print(f"   Batches: {result['completed_batches']} completed, {result['failed_batches']} failed")
     else:
         print(f"❌ {result['table_name']:40s} | FAILED: {result.get('error', 'Unknown')}")
 
 print()
 print("Next Step: Run DLT pipeline (Notebook 03) to transform Bronze → Silver")
 print()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View Checkpoint and Audit Logs
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View extraction audit summary
+# MAGIC SELECT
+# MAGIC   extraction_run_id,
+# MAGIC   table_name,
+# MAGIC   total_rows_extracted,
+# MAGIC   completed_batches,
+# MAGIC   failed_batches,
+# MAGIC   ROUND(duration_seconds, 2) as duration_sec,
+# MAGIC   ROUND(avg_throughput_rows_sec, 0) as throughput,
+# MAGIC   status,
+# MAGIC   start_timestamp
+# MAGIC FROM main.fh_bronze.extraction_audit_log
+# MAGIC ORDER BY start_timestamp DESC;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View batch-level checkpoints (for troubleshooting)
+# MAGIC SELECT
+# MAGIC   extraction_run_id,
+# MAGIC   table_name,
+# MAGIC   batch_number,
+# MAGIC   batch_row_count,
+# MAGIC   status,
+# MAGIC   retry_count,
+# MAGIC   error_message,
+# MAGIC   start_timestamp
+# MAGIC FROM main.fh_bronze.extraction_checkpoints
+# MAGIC WHERE status = 'failed'  -- Show only failed batches
+# MAGIC ORDER BY start_timestamp DESC;
 
 # COMMAND ----------
 
@@ -303,16 +559,10 @@ print()
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Check one table's properties
-# MAGIC DESCRIBE EXTENDED main.fh_bronze.dbo_Assets;
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Quick row count check
+# MAGIC -- Check one table's row count and metadata
 # MAGIC SELECT
-#  'dbo_Assets' as table_name,
-#   COUNT(*) as row_count,
-#   MIN(_ingestion_timestamp) as first_ingestion,
-#   MAX(_ingestion_timestamp) as last_ingestion
+# MAGIC   COUNT(*) as total_rows,
+# MAGIC   COUNT(DISTINCT _extraction_run_id) as extraction_runs,
+# MAGIC   MIN(_ingestion_timestamp) as first_ingestion,
+# MAGIC   MAX(_ingestion_timestamp) as last_ingestion
 # MAGIC FROM main.fh_bronze.dbo_Assets;
